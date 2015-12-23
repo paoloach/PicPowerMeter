@@ -1,3 +1,5 @@
+*.sch~
+*.sch#
 # Object files
 *.o
 *.ko

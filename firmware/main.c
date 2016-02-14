@@ -6,6 +6,7 @@
 #include <stdint.h>        /* For uint8_t definition */
 #include <stdbool.h>       /* For true/false definition */
 #include <string.h>
+#include <stdio.h>
 
 
 // #pragma config statements should precede project file includes.
@@ -39,8 +40,8 @@
 
 // CONFIG4L
 #pragma config STVREN = OFF     // Stack Full/Underflow Reset Enable bit (Stack full/underflow will not cause Reset)
-#pragma config LVP = ON         // Single-Supply ICSP Enable bit (Single-Supply ICSP enabled)
-#pragma config ICPRT = ON       // Dedicated In-Circuit Debug/Programming Port (ICPORT) Enable bit (ICPORT enabled)
+#pragma config LVP = OFF        // Single-Supply ICSP Enable bit (Single-Supply ICSP disabled)
+#pragma config ICPRT = OFF       // Dedicated In-Circuit Debug/Programming Port (ICPORT) Enable bit (ICPORT enabled)
 #pragma config XINST = OFF      // Extended Instruction Set Enable bit (Instruction set extension and Indexed Addressing mode disabled (Legacy mode))
 
 // CONFIG5L
@@ -77,15 +78,373 @@
 #include "system.h"        /* System funct/params, like osc/peripheral config */
 #include "user.h"          /* User funct/params, such as InitApp */
 #include "LCD.h"
+#include "SPI.h"
 
-void main(void)
-{
+#define CONFIGURATION 0
+#define CURRENT_DC_OFFSET 1
+#define CURRENT_GAIN 2
+#define VOLTAGE_DC_OFFSET  3
+#define VOLTAGE_GAIN 4
+#define CYCLE_COUNT 5
+#define PULSE_RATE 6
+#define INST_CURRENT 7
+#define INST_VOLT   8
+#define INST_POWER  9
+#define ACTIVE_POWER   10
+#define RMS_CURRENT 11
+#define RMS_VOLT    12
+#define EPSILON    13
+#define POWER_OFFSET 14
+#define STATUS_REG  15
+#define CURRENT_AC_OFFSET 16
+#define VOLTAGE_AC_OFFSET 17
+#define MODE 18
+#define TEMP 19
+#define MEAN_REACTIVE_POWER 20
+#define INST_REACTIVE_POWER 21
+#define PEAK_CURRENT 22
+#define PEAK_VOLTAGE 23
+#define CALCULATE_REACTIVE_POWER 24
+#define POWER_FACTOR 25
+#define INTERRUPT_MASK 26
+#define APPARENT_POWER 27
+#define CONTROL 28
+
+enum ShowStatus {
+    ssConf = 0,
+    ssCurrentDCOffset = 1,
+    ssCurrentGain,
+    ssVoltageOffset,
+    ssVoltageGain,
+    ssCycleCount,
+    ssPulseRate,
+    ssCurrent,
+    ssVolt,
+    ssPower,
+    ssActivePower,
+    ssRMSCurrent,
+    ssRMSVoltage,
+    ssEpsilon,
+    ssPowerOffset,
+    ssStatus,
+    ssCurrentACOffset,
+    ssVoltageAcOffset,
+    ssMode,
+    ssTemperature,
+    ssAverageReactivePower,
+    ssInstReactivePower,
+    ssPeakCurrent,
+    ssPeakVoltage,
+    ssCalculatedReactivePower,
+    ssPowerFactor,
+    ssIntMask,
+    ssApparemtPower,
+    ssControl,
+    ssLast
+
+};
+
+enum ShowStatus showStatus = ssActivePower;
+
+void calibration(void);
+
+double convertCurrent(uint24_t cur) {
+    double tmp;
+    if (cur & 0x800000) {
+        cur = ~cur;
+        cur++;
+        tmp = -1;
+    } else {
+        tmp = 1;
+    }
+    tmp = tmp * cur;
+    tmp = tmp / 0x7FFFFF;
+    tmp = tmp * 0.25;
+    return tmp;
+}
+
+double convertOffset(uint24_t offset) {
+    double tmp = 1;
+    if (offset & 0x800000) {
+        offset = ~offset;
+        offset++;
+        tmp = -1;
+    }
+    double tmp = tmp * offset;
+    tmp = tmp / 0x7FFFFF;
+    return tmp;
+}
+
+double convertInstVolt(uint24_t volt) {
+    double tmp;
+    if (volt & 0x800000) {
+        volt = ~volt;
+        volt++;
+        tmp = -1;
+    } else {
+        tmp = 1;
+    }
+    tmp = tmp * volt;
+    tmp = tmp / 0x7FFFFF;
+    tmp = tmp * 0.25;
+    tmp = tmp * 2200;
+    return tmp;
+}
+
+double convertRMSVolt(uint24_t volt) {
+    double tmp = volt;
+    tmp = tmp / 0xFFFFFF;
+    tmp = tmp * 0.25;
+    tmp = tmp * 2200;
+    return tmp;
+}
+
+double convertRMSCurrent(uint24_t volt) {
+    double tmp = volt;
+    tmp = tmp / 0xFFFFFF;
+    tmp = tmp * 0.25;
+    tmp = tmp / 0.04;
+    tmp = tmp * 10;
+    return tmp;
+}
+
+double convertPower(uint24_t power) {
+   double tmp;
+    if (power & 0x800000) {
+        power = ~power;
+        power++;
+        tmp = -1;
+    } else {
+        tmp = 1;
+    }
+    tmp = tmp * power;
+    tmp = tmp / 0x7FFFFF;
+    tmp = tmp * 0.25;
+    tmp = tmp * 2200;
+    tmp = tmp * 0.25;
+    tmp = tmp / 0.04;
+    tmp = tmp * 10;
+    tmp = tmp /4;
+    return tmp;
+}
+
+double convertCurrentGain(uint24_t gain) {
+    double tmp = gain;
+    tmp = tmp / 0x400000;
+    return tmp;
+}
+
+char buffer[20];
+
+void convertExe(uint24_t data) {
+    for (int i = 0; i < 6; i++) {
+        uint8_t nible = data & 0x04;
+        if (nible < 10) {
+            buffer[5 - i] = nible + '0';
+        } else {
+            buffer[5 - i] = nible + 'A';
+        }
+    }
+    buffer[6] = 0;
+}
+
+union data_t {
+    uint24_t lData;
+    unsigned char bytes[3];
+} data;
+
+void main(void) {
 
     /* Configure the oscillator for the device */
     ConfigureOscillator();
-    
 
-    
+
+
     /* Initialize I/O and Peripherals for application */
     InitApp();
+
+    resetCS();
+
+    startCSConversion();
+
+    line1();
+    writeLCD("START CALIBRATION");
+
+    calibration();
+
+    writeRegister(MODE, 0x00006000);
+    writeRegister(VOLTAGE_GAIN, 0x2F9000);
+    writeRegister(CURRENT_GAIN, 0x3Fe0000);
+
+    startCSConversion();
+    while (1) {
+        uint24_t status = readRegister(STATUS_REG);
+        line2();
+        if (!(status & 0x1)) {
+            convertExe(status);
+            writeLCD(buffer);
+            resetCS();
+            startCSConversion();
+            continue;
+        }
+        double readVal;
+        const char * measure;
+        switch (showStatus) {
+            case ssConf:
+                data.lData = readRegister(showStatus);
+                sprintf(buffer, "%02X%02X%02X    ", data.bytes[2], data.bytes[1], data.bytes[0]);
+                measure = "CONF    ";
+                break;
+            case ssCycleCount:
+                data.lData = readRegister(showStatus);
+                sprintf(buffer, "%d    ", data.lData);
+                measure = "CYCLE    ";
+                break;
+            case ssStatus:
+                data.lData = readRegister(showStatus);
+                sprintf(buffer, "%02X%02X%02X    ", data.bytes[2], data.bytes[1], data.bytes[0]);
+                measure = "STATUS    ";
+                break;
+            case ssMode:
+                data.lData = readRegister(showStatus);
+                sprintf(buffer, "%02X%02X%02X    ", data.bytes[2], data.bytes[1], data.bytes[0]);
+                measure = "MODE    ";
+                break;
+            case ssTemperature:
+                data.lData = readRegister(showStatus);
+                sprintf(buffer, "%02X%02X%02X    ", data.bytes[2], data.bytes[1], data.bytes[0]);
+                measure = "TEMP    ";
+                break;
+            case ssCurrentGain:
+                data.lData = readRegister(showStatus);
+                readVal = convertCurrentGain(data.lData);
+                measure = "I GAIN  ";
+                sprintf(buffer, "%f    ", readVal);
+                break;
+            case ssVoltageOffset:
+                data.lData = readRegister(showStatus);
+                readVal = convertOffset(data.lData);
+                measure = "VDC offset";
+                sprintf(buffer, "%f    ", readVal);
+                break;
+            case ssVoltageGain:
+                data.lData = readRegister(showStatus);
+                readVal = convertCurrentGain(data.lData);
+                measure = "V GAIN  ";
+                sprintf(buffer, "%f    ", readVal);
+                break;
+            case ssVoltageAcOffset:
+                data.lData = readRegister(showStatus);
+                readVal = convertOffset(data.lData);
+                measure = "VAC offset";
+                sprintf(buffer, "%f    ", readVal);
+                break;
+
+            case ssCurrent:
+                data.lData = readRegister(showStatus);
+                readVal = convertCurrent(data.lData);
+                measure = "CURRENT ";
+                sprintf(buffer, "%f    ", readVal);
+                break;
+            case ssVolt:
+                data.lData = readRegister(INST_VOLT);
+                readVal = convertInstVolt(data.lData);
+                measure = "VOLT    ";
+                sprintf(buffer, "%f    ", readVal);
+                break;
+            case ssRMSVoltage:
+                data.lData = readRegister(ssRMSVoltage);
+                readVal = convertRMSVolt(data.lData);
+                sprintf(buffer, "%f    ", readVal);
+                measure = "RMS VOLT";
+                break;
+            case ssRMSCurrent:
+                data.lData = readRegister(ssRMSCurrent);
+                readVal = convertRMSCurrent(data.lData);
+                sprintf(buffer, "%f    ", readVal);
+                measure = "RMS I";
+                break;
+            case ssPower:
+                data.lData = readRegister(INST_POWER);
+                readVal = convertPower(data.lData);
+                measure = "I POWER  ";
+                sprintf(buffer, "%f    ", readVal);
+                break;
+            case ssActivePower:
+                data.lData = readRegister(ssActivePower);
+                readVal = convertPower(data.lData);
+                measure = "I POWER  ";
+                sprintf(buffer, "%f    ", readVal);
+                break;
+            default:
+                data.lData = readRegister(showStatus);
+                sprintf(buffer, "%02X%02X%02X    ", data.bytes[2], data.bytes[1], data.bytes[0]);
+                measure = "        ";
+                break;
+        }
+
+        line1();
+        writeLCD(buffer);
+        line2();
+        writeLCD(measure);
+        if (PORTBbits.RB2 == 0) {
+            if (PORTBbits.RB2 == 0) {
+                showStatus++;
+                if (showStatus == ssLast) {
+                    showStatus = ssConf;
+                }
+                while (1) {
+                    if (PORTBbits.RB2 == 1) {
+                        if (PORTBbits.RB2 == 1) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+}
+
+void calibration() {
+    line2();
+    writeLCD("DC OFFSET");
+
+    while (1) {
+        uint24_t status = readRegister(STATUS_REG);
+        if (status & 0x800000) {
+            break;
+        }
+    }
+
+    LATC0 = 1;
+    LATC1 = 1;
+    TRISC0 = 0;
+    TRISC1 = 0;
+
+
+    SPIWriteByte(0xD9);
+
+    while (1) {
+        uint24_t status = readRegister(STATUS_REG);
+        if (status & 0x800000) {
+            break;
+        }
+    }
+
+    writeLCD("AC OFFSET");
+    SPIWriteByte(0xDD);
+
+    while (1) {
+        uint24_t status = readRegister(STATUS_REG);
+        if (status & 0x800000) {
+            break;
+        }
+    }
+
+
+    LATC0 = 0;
+    LATC1 = 0;
+    line2();
+    writeLCD("DONE");
 }

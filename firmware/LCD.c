@@ -1,4 +1,4 @@
-#include <stdint.h>
+
 #include "LCD.h"
 
 #include <xc.h>         /* XC8 General Include File */

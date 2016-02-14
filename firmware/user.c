@@ -30,5 +30,8 @@
 void InitApp(void){
     initLCD();
     initSPI();
+    TRISB2=1;
+    NOT_RBPU =0;
+    TRISC=0xFF;
 }
 

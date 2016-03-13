@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 
+#include "KS0108.h"
 
 // #pragma config statements should precede project file includes.
 // Use project enums instead of #define for ON and OFF.
@@ -18,7 +19,7 @@
 #pragma config USBDIV = 1       // USB Clock Selection bit (used in Full-Speed USB mode only; UCFG:FSEN = 1) (USB clock source comes directly from the primary oscillator block with no postscale)
 
 // CONFIG1H
-#pragma config FOSC = INTOSC_XT // Oscillator Selection bits (Internal oscillator, XT used by USB (INTXT))
+#pragma config FOSC = HS // Oscillator Selection bits (Internal oscillator, XT used by USB (INTXT))
 #pragma config FCMEN = OFF      // Fail-Safe Clock Monitor Enable bit (Fail-Safe Clock Monitor disabled)
 #pragma config IESO = OFF       // Internal/External Oscillator Switchover bit (Oscillator Switchover mode disabled)
 
@@ -77,7 +78,6 @@
 
 #include "system.h"        /* System funct/params, like osc/peripheral config */
 #include "user.h"          /* User funct/params, such as InitApp */
-#include "LCD.h"
 #include "SPI.h"
 
 #define CONFIGURATION 0
@@ -145,8 +145,37 @@ enum ShowStatus {
 };
 
 enum ShowStatus showStatus = ssActivePower;
+uint32_t totalSeconds = 0;
+uint8_t newMeasure;
+double power;
+
+uint8_t history[256];
+uint8_t * iterSrc;
+uint8_t * iterDst;
+uint8_t * iterEnd = history + 256;
+uint16_t historySize = 0;
+uint32_t sampleGraph;
+uint32_t measurePerSampleGraph = 1;
+uint32_t counterMeasureGraph = 0;
+
+#define MEASURE_FOR_HOUR    3600
+#define MEASURE_FOR_SAMPLE    10
+#define HISTORY_SIZE          MEASURE_FOR_HOUR / MEASURE_FOR_SAMPLE
+uint16_t lastHourHistory[HISTORY_SIZE];
+uint16_t indexHistory = 0;
+uint16_t sample;
+uint8_t sampleCount = 0;
+uint32_t powerTot;
+static char buffer[20];
+
+union data_t {
+    uint24_t lData;
+    unsigned char bytes[3];
+} data;
 
 void calibration(void);
+static void writeTime(void);
+static void displayGraph(void);
 
 double convertCurrent(uint24_t cur) {
     double tmp;
@@ -187,7 +216,7 @@ double convertInstVolt(uint24_t volt) {
     tmp = tmp * volt;
     tmp = tmp / 0x7FFFFF;
     tmp = tmp * 0.25;
-    tmp = tmp * 2200;
+    tmp = tmp * 2273;
     return tmp;
 }
 
@@ -204,12 +233,11 @@ double convertRMSCurrent(uint24_t volt) {
     tmp = tmp / 0xFFFFFF;
     tmp = tmp * 0.25;
     tmp = tmp / 0.04;
-    tmp = tmp * 10;
     return tmp;
 }
 
 double convertPower(uint24_t power) {
-   double tmp;
+    double tmp;
     if (power & 0x800000) {
         power = ~power;
         power++;
@@ -223,8 +251,6 @@ double convertPower(uint24_t power) {
     tmp = tmp * 2200;
     tmp = tmp * 0.25;
     tmp = tmp / 0.04;
-    tmp = tmp * 10;
-    tmp = tmp /4;
     return tmp;
 }
 
@@ -233,8 +259,6 @@ double convertCurrentGain(uint24_t gain) {
     tmp = tmp / 0x400000;
     return tmp;
 }
-
-char buffer[20];
 
 void convertExe(uint24_t data) {
     for (int i = 0; i < 6; i++) {
@@ -248,47 +272,200 @@ void convertExe(uint24_t data) {
     buffer[6] = 0;
 }
 
-union data_t {
-    uint24_t lData;
-    unsigned char bytes[3];
-} data;
-
 void main(void) {
 
-    /* Configure the oscillator for the device */
-    ConfigureOscillator();
-
-
-
-    /* Initialize I/O and Peripherals for application */
     InitApp();
 
     resetCS();
+    setPos(0, 0);
+    writeString("CALIBRATING...");
 
     startCSConversion();
-
-    line1();
-    writeLCD("START CALIBRATION");
 
     calibration();
 
-    writeRegister(MODE, 0x00006000);
-    writeRegister(VOLTAGE_GAIN, 0x2F9000);
-    writeRegister(CURRENT_GAIN, 0x3Fe0000);
+    writeRegister(MODE, 0x000060);
+    writeRegister(VOLTAGE_GAIN, 0x380000);
+    writeRegister(CURRENT_GAIN, 0x480000);
+
+    setPos(0, 0);
+    writeString("life time: ");
+    setPos(0, 1);
+    writeString("Power Inst:");
+    setPos(0, 2);
+    writeString("last hour:");
+    setPos(0, 3);
+    writeString("mean:");
 
     startCSConversion();
+    ei();
+    uint24_t status;
+    power=0;
+    while (1) {
+        status=0;
+        
+        while(newMeasure==0);
+        newMeasure = 0;
+        writeTime();
+        data.lData = readRegister(10);
+        power = convertPower(data.lData)+0.5;
+        sprintf(buffer, "%.0f   ", power);
+        setPos(66, 1);
+        writeString(buffer);
+
+        sample += power;
+        powerTot += power;
+        sampleCount++;
+        if (sampleCount == MEASURE_FOR_SAMPLE) {
+            uint32_t totPowerSample = 0;
+            sampleCount = 0;
+            sample /= MEASURE_FOR_SAMPLE;
+            lastHourHistory[indexHistory] = sample;
+            indexHistory++;
+            if (indexHistory == HISTORY_SIZE) {
+                indexHistory = 0;
+            }
+            for (uint16_t index = 0; index < HISTORY_SIZE; index++) {
+                totPowerSample += lastHourHistory[index];
+            }
+            uint16_t powerHour = totPowerSample / HISTORY_SIZE;
+            sprintf(buffer, "%d      ", powerHour);
+            setPos(66, 2);
+            writeString(buffer);
+            uint16_t powerMean = powerTot / totalSeconds;
+            sprintf(buffer, "%d       ", powerMean);
+            setPos(66, 3);
+            writeString(buffer);
+        }
+        displayGraph();
+    }
+}
+
+static void displayGraph(void) {
+    sampleGraph += power;
+    counterMeasureGraph++;
+    if (counterMeasureGraph == measurePerSampleGraph) {
+        counterMeasureGraph = 0;
+        sampleGraph /= 60;
+       // sampleGraph /= 30;
+        if (sampleGraph > 31) {
+            sampleGraph = 31;
+        }
+        history[historySize] = sampleGraph;
+        historySize++;
+        if (historySize >= 256) {
+            uint16_t mean;
+            iterSrc = history;
+            iterDst = history;
+            while (iterSrc < iterEnd) {
+                mean = *iterSrc;
+                iterSrc++;
+                mean += *iterSrc;
+                iterSrc++;
+                mean /= 2;
+                *iterDst = mean;
+                iterDst++;
+            }
+            historySize = 128;
+            measurePerSampleGraph *= 2;
+            sampleGraph=0;
+        }
+    }
+    if (historySize > 10) {
+        uint16_t pointsXvalue = 128 / historySize;
+        pointsXvalue = pointsXvalue * historySize + 128 % historySize;
+        uint16_t points;
+        uint8_t x = 0;
+        uint16_t value;
+        uint16_t remainPoints;
+        uint16_t meanValue;
+        uint8_t meanCount;
+        iterSrc = history;
+        iterEnd = history+historySize;
+        points = pointsXvalue;
+        value = *iterSrc;
+        while (iterSrc < iterEnd) {
+            for (; points > historySize; points -= historySize) {
+                verticalLine(x, value);
+                x++;
+            }
+            meanCount = 2;
+            meanValue = value * points;
+            remainPoints = historySize - points;
+            iterSrc++;
+            value = *iterSrc;
+            if (remainPoints > pointsXvalue) {
+                meanValue += value * pointsXvalue;
+                remainPoints -= pointsXvalue;
+                iterSrc++;
+                value = *iterSrc;
+                meanCount++;
+            }
+            meanValue += value * remainPoints;
+            meanValue /= ( historySize);
+            verticalLine(x, meanValue);
+            x++;
+            points = pointsXvalue - remainPoints;
+        }
+    }
+}
+
+void calibration() {
     while (1) {
         uint24_t status = readRegister(STATUS_REG);
-        line2();
-        if (!(status & 0x1)) {
-            convertExe(status);
-            writeLCD(buffer);
-            resetCS();
-            startCSConversion();
-            continue;
+        if (status & 0x800000) {
+            break;
         }
-        double readVal;
-        const char * measure;
+    }
+
+    LATC2 = 1;
+    TRISC2 = 0;
+
+
+    SPIWriteByte(0xD9);
+    setPos(0, 1);
+    writeString("STEP 1 ...");
+    while (1) {
+        uint24_t status = readRegister(STATUS_REG);
+        if (status & 0x800000) {
+            break;
+        }
+    }
+    setPos(0, 1);
+    writeString("STEP 1 done");
+
+    SPIWriteByte(0xDD);
+
+    while (1) {
+        uint24_t status = readRegister(STATUS_REG);
+        if (status & 0x800000) {
+            break;
+        }
+    }
+    setPos(0, 2);
+    writeString("STEP 2 done");
+
+
+    LATC2 = 0;
+}
+
+static void writeTime(void) {
+    uint32_t minutes = totalSeconds / 60;
+    uint8_t sec = totalSeconds % 60;
+    uint16_t hour = minutes / 60;
+    uint8_t min = minutes % 60;
+    uint16_t day = hour / 24;
+    uint8_t h = hour % 24;
+    setPos(60, 0);
+    sprintf(buffer, "%02d:%02d:%02d     ", h, min, sec);
+    writeString(buffer);
+}
+
+
+
+
+/*
+const char * measure;
         switch (showStatus) {
             case ssConf:
                 data.lData = readRegister(showStatus);
@@ -382,69 +559,4 @@ void main(void) {
                 measure = "        ";
                 break;
         }
-
-        line1();
-        writeLCD(buffer);
-        line2();
-        writeLCD(measure);
-        if (PORTBbits.RB2 == 0) {
-            if (PORTBbits.RB2 == 0) {
-                showStatus++;
-                if (showStatus == ssLast) {
-                    showStatus = ssConf;
-                }
-                while (1) {
-                    if (PORTBbits.RB2 == 1) {
-                        if (PORTBbits.RB2 == 1) {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-}
-
-void calibration() {
-    line2();
-    writeLCD("DC OFFSET");
-
-    while (1) {
-        uint24_t status = readRegister(STATUS_REG);
-        if (status & 0x800000) {
-            break;
-        }
-    }
-
-    LATC0 = 1;
-    LATC1 = 1;
-    TRISC0 = 0;
-    TRISC1 = 0;
-
-
-    SPIWriteByte(0xD9);
-
-    while (1) {
-        uint24_t status = readRegister(STATUS_REG);
-        if (status & 0x800000) {
-            break;
-        }
-    }
-
-    writeLCD("AC OFFSET");
-    SPIWriteByte(0xDD);
-
-    while (1) {
-        uint24_t status = readRegister(STATUS_REG);
-        if (status & 0x800000) {
-            break;
-        }
-    }
-
-
-    LATC0 = 0;
-    LATC1 = 0;
-    line2();
-    writeLCD("DONE");
-}
+ * */

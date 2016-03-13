@@ -18,20 +18,33 @@
 #endif
 
 #include "user.h"
-#include "LCD.h"
 #include "SPI.h"
+#include "KS0108.h"
 /******************************************************************************/
 /* User Functions                                                             */
 /******************************************************************************/
 
+#define TMR0_LOAD_L 0xE6
+#define TMR0_LOAD_H 0x48
 
 /* <Initialize variables in user.h and insert code for user algorithms.> */
 
 void InitApp(void){
-    initLCD();
+    initKS0108();
     initSPI();
-    TRISB2=1;
+    TRISA5=1;
     NOT_RBPU =0;
-    TRISC=0xFF;
+    TRISC=0xFC;
+    INTCON2bits.INTEDG2=1;
+    INTCON3bits.INT2IE=0;
+    INTCON3bits.INT2IP=1;
+    INTCON3bits.INT2F=0;
+    
+    TMR0L=TMR0_LOAD_L;
+    TMR0H=TMR0_LOAD_H;
+    INTCON2bits.T0IP=1;
+    INTCONbits.TMR0IF=0;
+    INTCONbits.TMR0IE=1;
+    T0CON = 0x85;
 }
 
